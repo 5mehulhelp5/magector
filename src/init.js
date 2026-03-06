@@ -6,6 +6,7 @@ import { execFileSync } from 'child_process';
 import { createInterface } from 'readline';
 import { homedir } from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { resolveBinary } from './binary.js';
 import { ensureModels } from './model.js';
 import { CURSOR_RULES_MDC } from './templates/cursor-rules-mdc.js';
@@ -203,7 +204,9 @@ export async function init(projectPath) {
   mkdirSync(path.join(projectPath, '.magector'), { recursive: true });
   const dbPath = path.join(projectPath, '.magector', 'index.db');
 
-  console.log('\nMagector Init\n');
+  const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+  const version = existsSync(pkgPath) ? JSON.parse(readFileSync(pkgPath, 'utf-8')).version : 'dev';
+  console.log(`\nMagector Init v${version}\n`);
 
   // 1. Verify Magento project
   console.log('Checking Magento project...');
