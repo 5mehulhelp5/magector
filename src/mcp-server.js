@@ -55,9 +55,11 @@ async function loadDescriptions() {
         logToFile('INFO', `Loaded ${Object.keys(descriptionMap).length} LLM descriptions via serve`);
         return;
       }
-    } catch {
-      // Fall through
+    } catch (err) {
+      logToFile('WARN', `Failed to load descriptions via serve: ${err.message}`);
     }
+  } else {
+    logToFile('INFO', 'Skipping description load (serve process not ready)');
   }
 
 }
@@ -82,13 +84,22 @@ function logToFile(level, message) {
 // Initialize log file on startup
 try { writeFileSync(LOG_PATH, `[${new Date().toISOString()}] [INFO] Magector MCP server starting\n`); } catch {}
 
+// Log resolved configuration so the log file is self-contained for debugging
+logToFile('INFO', `Config: MAGENTO_ROOT=${config.magentoRoot}`);
+logToFile('INFO', `Config: MAGECTOR_DB=${config.dbPath}`);
+logToFile('INFO', `Config: watchInterval=${config.watchInterval}s`);
+try { logToFile('INFO', `Config: rustBinary=${config.rustBinary}`); } catch (e) { logToFile('ERR', `Config: rustBinary resolution failed: ${e.message}`); }
+try { logToFile('INFO', `Config: modelCache=${config.modelCache}`); } catch (e) { logToFile('ERR', `Config: modelCache resolution failed: ${e.message}`); }
+logToFile('INFO', `Config: PID=${process.pid}`);
+
 // ─── Rust Core Integration ──────────────────────────────────────
 
-// Env vars to suppress ONNX Runtime native logs that would pollute stdout/JSON-RPC
+// Env vars for Rust subprocess logging — ORT_LOG_LEVEL suppresses ONNX native noise,
+// RUST_LOG=info surfaces watcher events, indexing progress, model loading, HNSW ops.
 const rustEnv = {
   ...process.env,
   ORT_LOG_LEVEL: 'error',
-  RUST_LOG: 'error',
+  RUST_LOG: 'info',
 };
 
 /**
@@ -236,6 +247,7 @@ function startBackgroundReindex() {
   if (existsSync(bgDescDbPath)) {
     reindexArgs.push('--descriptions-db', bgDescDbPath);
   }
+  logToFile('INFO', `Starting background reindex: ${config.rustBinary} ${reindexArgs.join(' ')}`);
   reindexProcess = spawn(config.rustBinary, reindexArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: rustEnv,
@@ -382,11 +394,20 @@ function startServeProcess() {
     if (existsSync(descDbPath)) {
       args.push('--descriptions-db', descDbPath);
     }
+    logToFile('INFO', `Starting serve process: ${config.rustBinary} ${args.join(' ')}`);
     const proc = spawn(config.rustBinary, args,
       { stdio: ['pipe', 'pipe', 'pipe'], env: rustEnv });
 
-    proc.on('error', () => { serveProcess = null; serveReady = false; removePidFile(); if (serveReadyResolve) { serveReadyResolve(false); serveReadyResolve = null; } });
-    proc.on('exit', () => { serveProcess = null; serveReady = false; removePidFile(); if (serveReadyResolve) { serveReadyResolve(false); serveReadyResolve = null; } });
+    proc.on('error', (err) => {
+      logToFile('ERR', `Serve process error: ${err.message}`);
+      serveProcess = null; serveReady = false; removePidFile();
+      if (serveReadyResolve) { serveReadyResolve(false); serveReadyResolve = null; }
+    });
+    proc.on('exit', (code, signal) => {
+      logToFile('WARN', `Serve process exited (code=${code}, signal=${signal})`);
+      serveProcess = null; serveReady = false; removePidFile();
+      if (serveReadyResolve) { serveReadyResolve(false); serveReadyResolve = null; }
+    });
     proc.stderr.on('data', (d) => {
       // Log serve process stderr (watcher events, tracing, errors) to .magector/magector.log
       // Strip ANSI escape codes for clean log output
@@ -397,11 +418,15 @@ function startServeProcess() {
     serveReadline = createInterface({ input: proc.stdout });
     serveReadline.on('line', (line) => {
       let parsed;
-      try { parsed = JSON.parse(line); } catch { return; }
+      try { parsed = JSON.parse(line); } catch {
+        logToFile('WARN', `Unparseable serve stdout: ${line.slice(0, 200)}`);
+        return;
+      }
 
       // First line is ready signal
       if (parsed.ready) {
         serveReady = true;
+        logToFile('INFO', `Serve process ready (PID ${proc.pid})`);
         if (serveReadyResolve) { serveReadyResolve(true); serveReadyResolve = null; }
         return;
       }
@@ -416,7 +441,9 @@ function startServeProcess() {
 
     serveProcess = proc;
     writePidFile(proc.pid);
-  } catch {
+    logToFile('INFO', `Serve process spawned (PID ${proc.pid})`);
+  } catch (err) {
+    logToFile('ERR', `Failed to start serve process: ${err.message}`);
     serveProcess = null;
     serveReady = false;
     if (serveReadyResolve) { serveReadyResolve(false); serveReadyResolve = null; }
@@ -426,8 +453,10 @@ function startServeProcess() {
 function serveQuery(command, params = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const id = serveNextId++;
+    logToFile('QUERY', `[${id}] → ${command}(${JSON.stringify(params).slice(0, 200)})`);
     const timer = setTimeout(() => {
       servePending.delete(id);
+      logToFile('ERR', `[${id}] ← ${command} TIMEOUT after ${timeoutMs}ms`);
       reject(new Error('Serve query timeout'));
     }, timeoutMs);
     servePending.set(id, {
@@ -441,11 +470,13 @@ function serveQuery(command, params = {}, timeoutMs = 30000) {
 async function rustSearchAsync(query, limit = 10) {
   const cacheKey = `${query}|${limit}`;
   if (searchCache.has(cacheKey)) {
+    logToFile('CACHE', `HIT: "${query}" (limit=${limit})`);
     return searchCache.get(cacheKey);
   }
 
   // Wait for serve process if it's starting up but not yet ready
   if (serveProcess && !serveReady && serveReadyPromise) {
+    logToFile('INFO', `Waiting for serve process to become ready...`);
     await Promise.race([serveReadyPromise, new Promise(r => setTimeout(() => r(false), 10000))]);
   }
 
@@ -457,12 +488,13 @@ async function rustSearchAsync(query, limit = 10) {
         cacheSet(cacheKey, resp.data);
         return resp.data;
       }
-    } catch {
-      // Fall through to execFileSync
+    } catch (err) {
+      logToFile('WARN', `Serve query failed, falling back to execFileSync: ${err.message}`);
     }
   }
 
   // Fallback: cold-start execFileSync
+  logToFile('INFO', `Using execFileSync fallback for search: "${query}"`);
   return rustSearchSync(query, limit);
 }
 
@@ -1894,7 +1926,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // SONA: flush accumulated feedback signals to Rust core
     const signals = sessionTracker.flush();
     if (signals.length > 0 && serveProcess && serveReady) {
-      serveQuery('feedback', { signals }).catch(() => {});
+      serveQuery('feedback', { signals }).catch((err) => logToFile('WARN', `Feedback signal send failed: ${err.message}`));
     }
   }
 });
@@ -1969,21 +2001,27 @@ async function main() {
 }
 
 // Cleanup on exit — kill all child processes and remove PID file
-function cleanup() {
+function cleanup(reason) {
+  logToFile('INFO', `Cleanup: ${reason || 'exit'}`);
   if (serveProcess) {
+    logToFile('INFO', `Cleanup: killing serve process (PID ${serveProcess.pid})`);
     try { serveProcess.kill(); } catch {}
     serveProcess = null;
   }
   if (reindexProcess) {
+    logToFile('INFO', `Cleanup: killing reindex process (PID ${reindexProcess.pid})`);
     try { reindexProcess.kill(); } catch {}
     reindexProcess = null;
   }
   removePidFile();
 }
 
-process.on('exit', cleanup);
-process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-process.on('SIGINT', () => { cleanup(); process.exit(0); });
-process.on('SIGHUP', () => { cleanup(); process.exit(0); });
+process.on('exit', () => cleanup('process exit'));
+process.on('SIGTERM', () => { cleanup('SIGTERM'); process.exit(0); });
+process.on('SIGINT', () => { cleanup('SIGINT'); process.exit(0); });
+process.on('SIGHUP', () => { cleanup('SIGHUP'); process.exit(0); });
 
-main().catch(console.error);
+main().catch((err) => {
+  logToFile('FATAL', `Startup failed: ${err.message}\n${err.stack}`);
+  console.error(err);
+});
