@@ -11,6 +11,7 @@ import path from 'path';
 import { resolveBinary } from './binary.js';
 import { ensureModels, resolveModels } from './model.js';
 import { init, setup } from './init.js';
+import { checkForUpdate } from './update.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -192,6 +193,9 @@ async function runDescribe(targetPath) {
 }
 
 async function main() {
+  // Auto-update: check npm for newer version, re-exec if found
+  await checkForUpdate(command, args);
+
   switch (command) {
     case 'init':
       await init(args[1]);
