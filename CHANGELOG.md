@@ -4,6 +4,16 @@ All notable changes to Magector are documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/). Versions correspond to git tags and npm releases.
 
+## [1.6.0] - 2026-03-13
+
+### Added
+- `.magectorignore` file support — place a `.magectorignore` file in the Magento project root to exclude additional directories from indexing. Uses gitignore-like syntax: one pattern per line, `#` comments, trailing slashes stripped. Patterns without `/` match directory names anywhere; patterns with `/` match relative paths from project root.
+- `EXCLUDE_PATHS` constant for path-based exclusions (`pub/static`, `dev/tests`, `dev/tools`) that require more than directory name matching
+
+### Fixed
+- **`vendor/` directory now excluded from indexing** — previously only `vendor/bin` was in the exclude list, but the name-based matching never worked for path entries. This caused 100K-500K third-party Composer files to be indexed, leading to 30+ minute timeouts on large Magento codebases. Indexing time drops from 30+ minutes to 1-5 minutes for typical projects.
+- Dead code in `EXCLUDE_DIRS` — entries with path separators (`vendor/bin`, `pub/static`, `dev/tests`, `dev/tools`) never matched because `should_skip_dir()` compared against `file_name()` (leaf component only). Moved path-based entries to a new `EXCLUDE_PATHS` check that uses relative path matching.
+
 ## [1.5.3] - 2026-03-10
 
 ### Fixed

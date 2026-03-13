@@ -838,6 +838,41 @@ Copy `.cursorrules` to your Magento project root for optimized AI-assisted devel
 3. Follow Magento development patterns
 4. Interpret search results correctly
 
+### Excluding Directories (`.magectorignore`)
+
+Magector automatically skips common non-project directories during indexing:
+
+- `vendor/` — Composer dependencies (100K-500K files)
+- `node_modules/` — npm packages
+- `generated/` — DI-compiled files
+- `var/` — cache, logs, sessions
+- `pub/static/` — deployed static assets
+- `dev/tests/`, `dev/tools/` — Magento development tools
+- `Test/`, `Tests/`, `test/`, `tests/` — test directories
+- `.git/` — version control
+
+For project-specific exclusions, create a `.magectorignore` file in your Magento project root:
+
+```gitignore
+# .magectorignore — additional directories to exclude from Magector indexing
+# One pattern per line, gitignore-like syntax
+
+# Custom exclusions
+pub/media
+setup
+update
+phpserver
+bin
+lib/internal
+```
+
+**Pattern rules:**
+- Lines starting with `#` are comments
+- Empty lines are ignored
+- Trailing slashes are stripped (`vendor/` → `vendor`)
+- Patterns without `/` match directory names anywhere in the tree
+- Patterns with `/` match relative paths from the project root
+
 ### Model Configuration
 
 The ONNX model (`all-MiniLM-L6-v2`) is automatically downloaded on first run to `~/.magector/models/`. To use a different location:

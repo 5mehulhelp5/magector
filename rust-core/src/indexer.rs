@@ -20,16 +20,13 @@ use crate::vectordb::{IndexMetadata, VectorDB};
 /// File patterns to index
 pub(crate) const INCLUDE_EXTENSIONS: &[&str] = &["php", "xml", "phtml", "js", "graphqls"];
 
-/// Directories to skip
+/// Directories to always skip (matched against directory name, not path)
 pub(crate) const EXCLUDE_DIRS: &[&str] = &[
     "node_modules",
-    "vendor/bin",
+    "vendor",
     ".git",
     "var",
-    "pub/static",
     "generated",
-    "dev/tests",
-    "dev/tools",
     "Test",
     "Tests",
     "test",
@@ -37,6 +34,14 @@ pub(crate) const EXCLUDE_DIRS: &[&str] = &[
     "_files",
     "fixtures",
     "performance-toolkit",
+];
+
+/// Additional directories to skip by relative path prefix.
+/// These handle cases where the directory name alone is too generic (e.g., "static").
+pub(crate) const EXCLUDE_PATHS: &[&str] = &[
+    "pub/static",
+    "dev/tests",
+    "dev/tools",
 ];
 
 /// Maximum file size to index (100KB)
@@ -87,6 +92,8 @@ pub struct Indexer {
     pub sona: Option<crate::sona::SonaEngine>,
     pub db_path: Option<PathBuf>,
     descriptions_db: Option<PathBuf>,
+    /// Custom ignore patterns loaded from .magectorignore
+    ignore_patterns: Vec<String>,
 }
 
 impl Indexer {
@@ -113,6 +120,9 @@ impl Indexer {
             crate::sona::SonaEngine::open(&sona_path).ok()
         };
 
+        // Load .magectorignore patterns
+        let ignore_patterns = Self::load_ignore_file(magento_root);
+
         Ok(Self {
             embedder,
             vectordb,
@@ -122,6 +132,7 @@ impl Indexer {
             sona: sona.or_else(|| Some(crate::sona::SonaEngine::new())),
             db_path: Some(db_path.to_path_buf()),
             descriptions_db: None,
+            ignore_patterns,
         })
     }
 
@@ -145,6 +156,9 @@ impl Indexer {
         println!();
 
         println!("📁 Source: {:?}", self.magento_root);
+        if !self.ignore_patterns.is_empty() {
+            println!("📋 .magectorignore: {} custom patterns loaded", self.ignore_patterns.len());
+        }
         println!("🔍 Discovering files...");
 
         let files = self.discover_files()?;
@@ -330,11 +344,13 @@ impl Indexer {
     /// Discover files to index (no symlink following for speed)
     pub(crate) fn discover_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
+        let root = &self.magento_root;
+        let ignore = &self.ignore_patterns;
 
-        for entry in WalkDir::new(&self.magento_root)
+        for entry in WalkDir::new(root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| !Self::should_skip_dir(e))
+            .filter_entry(|e| !Self::should_skip_entry(e, root, ignore))
         {
             let entry = entry?;
             if entry.file_type().is_file() {
@@ -357,13 +373,96 @@ impl Indexer {
         Ok(files)
     }
 
-    /// Check if directory should be skipped
+    /// Check if a directory entry should be skipped during traversal.
+    ///
+    /// Checks (in order, cheapest first):
+    /// 1. Directory name against EXCLUDE_DIRS (O(1) per entry)
+    /// 2. Relative path prefix against EXCLUDE_PATHS (for nested paths like pub/static)
+    /// 3. .magectorignore patterns (directory prefix matching)
+    pub(crate) fn should_skip_entry(
+        entry: &walkdir::DirEntry,
+        root: &Path,
+        ignore_patterns: &[String],
+    ) -> bool {
+        if !entry.file_type().is_dir() {
+            return false;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+
+        // 1. Fast: exact directory name match
+        if EXCLUDE_DIRS.iter().any(|&d| name == *d) {
+            return true;
+        }
+
+        // 2. Relative path prefix match (for paths like pub/static, dev/tools)
+        if let Ok(relative) = entry.path().strip_prefix(root) {
+            let rel_str = relative.to_string_lossy();
+
+            // Check built-in path exclusions
+            if EXCLUDE_PATHS.iter().any(|&p| rel_str == p || rel_str.starts_with(&format!("{}/", p))) {
+                return true;
+            }
+
+            // 3. .magectorignore patterns (directory prefix matching)
+            if !ignore_patterns.is_empty() {
+                for pattern in ignore_patterns {
+                    let trimmed = pattern.trim_end_matches('/');
+                    // Exact match: "some/dir" matches "some/dir"
+                    // Prefix match: "some/dir" matches "some/dir/subdir"
+                    // Name match: "dirname" matches any directory with that name
+                    if rel_str == trimmed
+                        || rel_str.starts_with(&format!("{}/", trimmed))
+                        || (!trimmed.contains('/') && name == *trimmed)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Backwards-compatible check for external callers (watcher.rs).
+    /// Uses only built-in exclusions, no .magectorignore patterns.
     pub(crate) fn should_skip_dir(entry: &walkdir::DirEntry) -> bool {
         if entry.file_type().is_dir() {
             let name = entry.file_name().to_string_lossy();
-            return EXCLUDE_DIRS.iter().any(|&d| name == d);
+            return EXCLUDE_DIRS.iter().any(|&d| name == *d);
         }
         false
+    }
+
+    /// Load .magectorignore file from the project root.
+    /// Returns a list of directory patterns to exclude.
+    ///
+    /// Format (one pattern per line, similar to .gitignore):
+    ///   - Lines starting with # are comments
+    ///   - Empty lines are ignored
+    ///   - Trailing slashes are stripped
+    ///   - Patterns without / match directory names anywhere
+    ///   - Patterns with / match relative paths from project root
+    fn load_ignore_file(root: &Path) -> Vec<String> {
+        let ignore_path = root.join(".magectorignore");
+        match fs::read_to_string(&ignore_path) {
+            Ok(content) => {
+                let patterns: Vec<String> = content
+                    .lines()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| line.trim_end_matches('/').to_string())
+                    .collect();
+                if !patterns.is_empty() {
+                    tracing::info!(
+                        "Loaded {} patterns from .magectorignore",
+                        patterns.len()
+                    );
+                }
+                patterns
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Parse a single file (no embedding, can be parallelized with thread-local AST)

@@ -129,3 +129,4 @@ Rust binaries are distributed as npm optional dependencies (`@magector/cli-darwi
 | `MAGECTOR_DB` | `./.magector/index.db` | Index database path |
 | `MAGECTOR_BIN` | (auto-resolved) | Override magector-core binary path |
 | `MAGECTOR_MODELS` | (auto-resolved) | Override ONNX model directory |
+| `MAGECTOR_INDEX_TIMEOUT` | 1800000 | Indexing timeout in milliseconds |
